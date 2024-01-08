@@ -1,18 +1,19 @@
 MQTT Test is a CLI command used to test and benchmark the MQTT support in [NATS Server](https://github.com/nats-io/nats-server)
 
+Outputs JSON results that can be reported in a `go test --bench` wrapper.
 
 #### Usage
 
 ##### Subcommands and common flags
 
 ```sh
-mqtt-test [pub|pubsub] [flags...]
+mqtt-test [pub|pubsub|subret] [flags...]
 ```
 
 Available Commands:
 - [pub](#pub) - Publish N messages
-- [pubsub](#pubsub) - Subscribe and receive N messages
-
+- [pubsub](#pubsub) - Subscribe and receive N published messages
+- [subret](#subret) - Subscribe N times, and receive NTopics retained messages
 Common Flags:
 ```
 -h, --help                  help for mqtt-test
@@ -53,4 +54,17 @@ Publishes N messages, and waits for all of them to be received by subscribers. M
 --qos int               MQTT QOS
 --size int              Approximate size of each message (pub adds a timestamp)
 --topic string          MQTT topic
+```
+
+##### subret
+
+Publishes retained messages into NTopics, then subscribes to a wildcard with all
+topics N times. Measures time to SUBACK and to all retained messages received.
+Used with `--num-subscribers` can run several concurrent subscriber connections.
+
+```
+--num-subscribers int   Number of subscribers to run concurrently (default 1)
+--num-topics int        Use this many topics with retained messages
+--qos int               MQTT QOS
+--size int              Approximate size of each message (pub adds a timestamp)
 ```
