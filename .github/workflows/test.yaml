@@ -1,0 +1,37 @@
+name: Test with nats-server 
+on: [push, pull_request]
+
+jobs:
+  test:
+    env:
+      GOPATH: /home/runner/work/mqtt-test/go
+      GO111MODULE: "on"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Setup Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: 1.21
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          path: go/src/github.com/ConnectEverything/mqtt-test
+
+      - name: Checkout nats-server
+        uses: actions/checkout@v4
+        with:
+          repository: nats-io/nats-server
+          path: go/src/github.com/nats-io/nats-server
+
+      - name: Build and install
+        shell: bash --noprofile --norc -x -eo pipefail {0}
+        run: |
+          cd go/src/github.com/ConnectEverything/mqtt-test
+          go install -v .
+
+      - name: Run 'MQTTEx from nats-server'
+        shell: bash --noprofile --norc -x -eo pipefail {0}
+        run: |
+          cd go/src/github.com/nats-io/nats-server
+          go test -v --run='-' --bench 'MQTTEx' --benchtime=100x ./server | tee /tmp/current-bench-result.txt
