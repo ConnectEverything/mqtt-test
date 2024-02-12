@@ -18,7 +18,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -124,7 +123,8 @@ func (r *receiver) msgHandler(client paho.Client, msg paho.Message) {
 	default:
 		newC := r.cPublished.Add(1)
 		if newC > int32(r.expectPublished) {
-			r.errCh <- fmt.Errorf("received unexpected published message")
+			r.errCh <- fmt.Errorf("received unexpected published message: dup:%v, topic: %s, qos:%v, retained:%v, payload: %q",
+				msg.Duplicate(), msg.Topic(), msg.Qos(), msg.Retained(), msg.Payload())
 			return
 		}
 
@@ -150,64 +150,4 @@ func (r *receiver) msgHandler(client paho.Client, msg paho.Message) {
 			NS:    map[string]time.Duration{"receive": time.Duration(dur)},
 		}
 	}
-}
-
-func runSubWithPubret(
-	nSubscribers int,
-	repeat int,
-	expectRetained,
-	expectPublished int,
-	messageOpts messageOpts,
-	prepublishRetained bool,
-) *Stat {
-	errCh := make(chan error)
-
-	if prepublishRetained {
-		p := &publisher{
-			clientID:    ClientID + "-pub",
-			messages:    expectRetained,
-			topics:      expectRetained,
-			messageOpts: messageOpts,
-		}
-		p.messageOpts.retain = true
-		p.publish(nil, errCh, true)
-	}
-
-	// Connect all subscribers (and subscribe to a wildcard topic that includes
-	// all published retained messages).
-	statsCh := make(chan *Stat)
-	for i := 0; i < nSubscribers; i++ {
-		r := &receiver{
-			clientID:        ClientID + "-sub-" + strconv.Itoa(i),
-			filterPrefix:    messageOpts.topic,
-			topic:           messageOpts.topic + "/+",
-			qos:             messageOpts.qos,
-			expectRetained:  expectRetained,
-			expectPublished: expectPublished,
-			repeat:          repeat,
-		}
-		go r.receive(nil, statsCh, errCh)
-	}
-
-	// wait for the stats
-	total := &Stat{
-		NS: make(map[string]time.Duration),
-	}
-	timeout := time.NewTimer(Timeout)
-	defer timeout.Stop()
-	for i := 0; i < nSubscribers*repeat; i++ {
-		select {
-		case stat := <-statsCh:
-			total.Ops += stat.Ops
-			total.Bytes += stat.Bytes
-			for k, v := range stat.NS {
-				total.NS[k] += v
-			}
-		case err := <-errCh:
-			log.Fatalf("Error: %v", err)
-		case <-timeout.C:
-			log.Fatalf("Error: timeout waiting for messages")
-		}
-	}
-	return total
 }

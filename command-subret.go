@@ -27,7 +27,7 @@ type subretCommand struct {
 	// test options
 	repeat      int
 	subscribers int
-	messages      int
+	messages    int
 }
 
 func newSubRetCommand() *cobra.Command {
@@ -51,7 +51,7 @@ func newSubRetCommand() *cobra.Command {
 }
 
 func (c *subretCommand) run(_ *cobra.Command, _ []string) {
-	total := runSubWithPubret(c.subscribers, c.repeat, c.messages, 0, c.messageOpts, true)
+	total := runSubPrepublishRetained(c.subscribers, c.repeat, c.messages, 0, c.messageOpts, true)
 	bb, _ := json.Marshal(total)
 	os.Stdout.Write(bb)
 }
