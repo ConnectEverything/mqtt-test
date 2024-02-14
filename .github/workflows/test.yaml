@@ -23,7 +23,7 @@ jobs:
         with:
           repository: nats-io/nats-server
           path: go/src/github.com/nats-io/nats-server
-          ref: 40aaa59
+          ref: lev-mqttex-test-retained
 
       - name: Build and install
         shell: bash --noprofile --norc -x -eo pipefail {0}
