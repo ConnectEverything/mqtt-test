@@ -23,6 +23,7 @@ jobs:
         with:
           repository: nats-io/nats-server
           path: go/src/github.com/nats-io/nats-server
+          ref: 40aaa59
 
       - name: Build and install
         shell: bash --noprofile --norc -x -eo pipefail {0}
@@ -34,4 +35,4 @@ jobs:
         shell: bash --noprofile --norc -x -eo pipefail {0}
         run: |
           cd go/src/github.com/nats-io/nats-server
-          go test -v --run='-' --bench 'MQTTEx' --benchtime=100x ./server | tee /tmp/current-bench-result.txt
+          go test -v --run='MQTTEx' --bench 'MQTTEx' --benchtime=100x ./server
