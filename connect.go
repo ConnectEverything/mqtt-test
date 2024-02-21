@@ -2,8 +2,6 @@ package main
 
 import (
 	"log"
-	"strings"
-	"sync/atomic"
 	"time"
 
 	paho "github.com/eclipse/paho.mqtt.golang"
@@ -28,44 +26,14 @@ const (
 	PersistentSession = false
 )
 
-var nextConnectServerIndex = atomic.Uint64{}
-
-func connect(clientID string, cleanSession bool) (paho.Client, *Stat, func(), error) {
+func connect(d dial, clientID string, cleanSession bool) (paho.Client, func(), error) {
 	if clientID == "" {
 		clientID = ClientID
 	}
 	if clientID == "" {
 		clientID = Name + "-" + nuid.Next()
 	}
-
-	parseDial := func(in string) (u, p, s, c string) {
-		if in == "" {
-			return "", "", DefaultServer, ""
-		}
-
-		if i := strings.LastIndex(in, "#"); i != -1 {
-			c = in[i+1:]
-			in = in[:i]
-		}
-
-		if i := strings.LastIndex(in, "@"); i != -1 {
-			up := in[:i]
-			in = in[i+1:]
-			u = up
-			if i := strings.Index(up, ":"); i != -1 {
-				u = up[:i]
-				p = up[i+1:]
-			}
-		}
-
-		s = in
-		return u, p, s, c
-	}
-
-	// round-robin the servers. since we start at 0 and add first, subtract 1 to
-	// compensate and start at 0!
-	next := int((nextConnectServerIndex.Add(1) - 1) % uint64(len(Servers)))
-	u, p, s, c := parseDial(Servers[next])
+	u, p, s, _ := d.parse()
 
 	cl := paho.NewClient(paho.NewClientOptions().
 		SetClientID(clientID).
@@ -84,22 +52,16 @@ func connect(clientID string, cleanSession bool) (paho.Client, *Stat, func(), er
 	start := time.Now()
 	if t := cl.Connect(); t.Wait() && t.Error() != nil {
 		disconnectedWG.Done()
-		return nil, nil, nil, t.Error()
+		return nil, nil, t.Error()
 	}
 
-	if c != "" {
-		logOp(clientID, "CONN", time.Since(start), "Connected to %q (%s)\n", s, c)
-	} else {
-		logOp(clientID, "CONN", time.Since(start), "Connected to %q\n", s)
+	recordOp(clientID, d, "conn", 1, time.Since(start), 0, "Connected to %s\n", d.String())
+
+	cleanup := func() {
+		start := time.Now()
+		cl.Disconnect(DisconnectCleanupTimeout)
+		recordOp(clientID, d, "disc", 1, time.Since(start), 0, "Disconnected from %s\n", d.String())
+		disconnectedWG.Done()
 	}
-	return cl,
-		&Stat{
-			Ops: 1,
-			NS:  map[string]time.Duration{"conn": time.Since(start)},
-		},
-		func() {
-			cl.Disconnect(DisconnectCleanupTimeout)
-			disconnectedWG.Done()
-		},
-		nil
+	return cl, cleanup, nil
 }
