@@ -16,7 +16,6 @@ package main
 import (
 	"bytes"
 	"encoding/json"
-	"fmt"
 	"log"
 	"strings"
 	"sync/atomic"
@@ -26,66 +25,74 @@ import (
 )
 
 type receiver struct {
+	dial            dial   // MQTT server to connect to.
 	clientID        string // MQTT client ID.
-	topic           string // Subscription topic.
+	expectPublished int    // expect to receive this many published messages.
+	expectRetained  int    // expect to receive this many retained messages.
+	expectTimestamp bool   // Expect a timestamp in the payload.
 	filterPrefix    string // Only count messages if their topic starts with the prefix.
 	qos             int    // MQTT QOS for the subscription.
-	expectRetained  int    // expect to receive this many retained messages.
-	expectPublished int    // expect to receive this many published messages.
 	repeat          int    // Number of times to repeat subscribe/receive/unsubscribe.
+	topic           string // Subscription topic.
 
-	cRetained    atomic.Int32 // Count of retained messages received.
-	cPublished   atomic.Int32 // Count of published messages received.
-	durPublished atomic.Int64 // Total duration of published messages received (measured from the sent timestamp in the message).
-	bc           atomic.Int64 // Byte count of all messages received.
-
-	start  time.Time
-	errCh  chan error
-	statCh chan *Stat
+	// state
+	cRetained     *atomic.Int32 // Count of retained messages received.
+	cPublished    *atomic.Int32 // Count of published messages received.
+	durPublished  *atomic.Int64 // Total duration of published messages received (measured from the sent timestamp in the message).
+	bc            *atomic.Int64 // Byte count of all messages received.
+	start         time.Time
+	allReceivedCh chan struct{} // Signal that all expected messages have been received.
 }
 
-func (r *receiver) receive(readyCh chan struct{}, statCh chan *Stat, errCh chan error) {
-	r.errCh = errCh
-	r.statCh = make(chan *Stat)
+func (r *receiver) receive(readyCh chan struct{}, doneCh chan struct{}) {
+	defer func() {
+		if doneCh != nil {
+			doneCh <- struct{}{}
+		}
+	}()
+
 	if r.filterPrefix == "" {
 		r.filterPrefix = r.topic
 	}
 
-	cl, _, cleanup, err := connect(r.clientID, CleanSession)
+	cl, cleanup, err := connect(r.dial, r.clientID, CleanSession)
 	if err != nil {
-		errCh <- err
-		return
+		log.Fatal(err)
 	}
+	defer cleanup()
 
 	for i := 0; i < r.repeat; i++ {
-		// Reset the stats for each iteration.
+		// Reset the state for each iteration.
+		r.cRetained = new(atomic.Int32)
+		r.cPublished = new(atomic.Int32)
+		r.durPublished = new(atomic.Int64)
+		r.bc = new(atomic.Int64)
 		r.start = time.Now()
-		r.cRetained.Store(0)
-		r.cPublished.Store(0)
-		r.durPublished.Store(0)
-		r.bc.Store(0)
+		r.allReceivedCh = make(chan struct{})
 
 		token := cl.Subscribe(r.topic, byte(r.qos), r.msgHandler)
 		if token.Wait() && token.Error() != nil {
-			errCh <- token.Error()
-			return
+			log.Fatal(token.Error())
 		}
-		logOp(r.clientID, "SUB", time.Since(r.start), "Subscribed to %q", r.topic)
+		elapsed := time.Since(r.start)
+		r.start = time.Now()
+		recordOp(r.clientID, r.dial, "sub", 1, elapsed, 0, "Subscribed to %q", r.topic)
+
+		// signal that the sub is ready to receive (pulished) messages.
 		if readyCh != nil {
 			readyCh <- struct{}{}
 		}
 
-		// wait for the stat value, then clean up and forward it to the caller. Errors are handled by the caller.
-		stat := <-r.statCh
-		statCh <- stat
+		// wait for all messages to be received, then clean up and signal to the caller.
+		<-r.allReceivedCh
 
+		start := time.Now()
 		token = cl.Unsubscribe(r.topic)
 		if token.Wait() && token.Error() != nil {
-			errCh <- token.Error()
-			return
+			log.Fatal(token.Error())
 		}
+		recordOp(r.clientID, r.dial, "unsub", 1, time.Since(start), 0, "Unsubscribed from %q", r.topic)
 	}
-	cleanup()
 }
 
 func (r *receiver) msgHandler(client paho.Client, msg paho.Message) {
@@ -97,57 +104,49 @@ func (r *receiver) msgHandler(client paho.Client, msg paho.Message) {
 		return
 
 	case msg.Duplicate():
-		r.errCh <- fmt.Errorf("received unexpected duplicate message")
+		log.Fatalf("received unexpected duplicate message")
 		return
 
 	case msg.Retained():
 		newC := r.cRetained.Add(1)
 		if newC > int32(r.expectRetained) {
-			r.errCh <- fmt.Errorf("received unexpected retained message")
+			log.Fatalf("received unexpected retained message")
 			return
 		}
-		logOp(clientID, "RRET ->", time.Since(r.start), "Received %d bytes on %q, qos:%v", len(msg.Payload()), msg.Topic(), msg.Qos())
-		r.bc.Add(int64(len(msg.Payload())))
-
+		bc := r.bc.Add(int64(len(msg.Payload())))
 		if newC < int32(r.expectRetained) {
 			return
 		}
 		elapsed := time.Since(r.start)
-		r.statCh <- &Stat{
-			Ops:   1,
-			NS:    map[string]time.Duration{fmt.Sprintf("rec%vret", r.expectRetained): elapsed},
-			Bytes: r.bc.Load(),
-		}
+		recordOp(r.clientID, r.dial, "rec-ret", r.expectRetained, elapsed, bc, "Received %d retained messages", r.expectRetained)
+		close(r.allReceivedCh)
 		return
 
 	default:
 		newC := r.cPublished.Add(1)
 		if newC > int32(r.expectPublished) {
-			r.errCh <- fmt.Errorf("received unexpected published message: dup:%v, topic: %s, qos:%v, retained:%v, payload: %q",
+			log.Fatalf("received unexpected published message: dup:%v, topic: %s, qos:%v, retained:%v, payload: %q",
 				msg.Duplicate(), msg.Topic(), msg.Qos(), msg.Retained(), msg.Payload())
 			return
 		}
 
-		v := PubValue{}
-		body := msg.Payload()
-		if i := bytes.IndexByte(body, '\n'); i != -1 {
-			body = body[:i]
+		elapsed := time.Since(r.start)
+		if r.expectTimestamp {
+			v := PubValue{}
+			body := msg.Payload()
+			if i := bytes.IndexByte(body, '\n'); i != -1 {
+				body = body[:i]
+			}
+			if err := json.Unmarshal(body, &v); err != nil {
+				log.Fatalf("Error parsing message JSON: %v", err)
+			}
+			elapsed = time.Since(time.Unix(0, v.Timestamp))
 		}
-		if err := json.Unmarshal(body, &v); err != nil {
-			log.Fatalf("Error parsing message JSON: %v", err)
-		}
-		elapsed := time.Since(time.Unix(0, v.Timestamp))
-		logOp(clientID, "RPUB ->", elapsed, "Received %d bytes on %q, qos:%v", len(msg.Payload()), msg.Topic(), msg.Qos())
+		recordOp(clientID, r.dial, "rec", 1, elapsed, int64(len(msg.Payload())), "Received published message on %q", msg.Topic())
 
-		dur := r.durPublished.Add(int64(elapsed))
-		bb := r.bc.Add(int64(len(msg.Payload())))
 		if newC < int32(r.expectPublished) {
 			return
 		}
-		r.statCh <- &Stat{
-			Ops:   r.expectPublished,
-			Bytes: bb,
-			NS:    map[string]time.Duration{"receive": time.Duration(dur)},
-		}
+		close(r.allReceivedCh)
 	}
 }
