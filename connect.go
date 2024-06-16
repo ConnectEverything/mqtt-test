@@ -27,6 +27,9 @@ const (
 )
 
 func connect(d dial, clientID string, cleanSession bool) (paho.Client, func(), error) {
+	<-concurrentConnects
+	defer func() { concurrentConnects <- struct{}{} }()
+
 	if clientID == "" {
 		clientID = ClientID
 	}

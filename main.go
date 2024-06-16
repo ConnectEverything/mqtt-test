@@ -33,14 +33,17 @@ const (
 )
 
 var (
-	ClientID string
-	Password string
-	Quiet    bool
-	Servers  []string
-	Username string
-	Verbose  bool
-	Timeout  time.Duration
+	ClientID              string
+	Password              string
+	Quiet                 bool
+	Servers               []string
+	Username              string
+	Verbose               bool
+	Timeout               time.Duration
+	MaxConcurrentConnects int
 )
+
+var concurrentConnects chan struct{}
 
 type Stat struct {
 	Ops   int           `json:"ops"`
@@ -67,6 +70,7 @@ func init() {
 	mainCmd.PersistentFlags().StringArrayVarP(&Servers, "server", "s", []string{DefaultServer}, "MQTT endpoint as username:password@host:port")
 	mainCmd.PersistentFlags().BoolVarP(&Quiet, "quiet", "q", false, "Quiet mode, only print results")
 	mainCmd.PersistentFlags().BoolVarP(&Verbose, "very-verbose", "v", false, "Very verbose, print everything we can")
+	mainCmd.PersistentFlags().IntVar(&MaxConcurrentConnects, "concurrent-connects", 50, "Number of active CONNECTs to allow at once")
 
 	oldServers := mainCmd.PersistentFlags().StringArray("servers", nil, "MQTT endpoint as username:password@host:port")
 	mainCmd.PersistentFlags().MarkDeprecated("servers", "please use server instead.")
@@ -86,6 +90,11 @@ func init() {
 
 		if len(*oldServers) > 0 {
 			Servers = *oldServers
+		}
+
+		concurrentConnects = make(chan struct{}, MaxConcurrentConnects)
+		for i := 0; i < MaxConcurrentConnects; i++ {
+			concurrentConnects <- struct{}{}
 		}
 	}
 
