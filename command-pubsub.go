@@ -14,25 +14,20 @@
 package main
 
 import (
-	"encoding/json"
-	"log"
-	"os"
 	"strconv"
-	"time"
 
 	"github.com/spf13/cobra"
 )
 
 type pubsubCommand struct {
-	messageOpts
-
-	messages    int
+	pubOpts     publisher
+	subOpts     receiver
 	subscribers int
+	pubServer   string
 }
 
 func newPubSubCommand() *cobra.Command {
 	c := &pubsubCommand{}
-
 	cmd := &cobra.Command{
 		Use:   "pubsub [--flags...]",
 		Short: "Subscribe and receive N published messages",
@@ -40,81 +35,70 @@ func newPubSubCommand() *cobra.Command {
 		Args:  cobra.NoArgs,
 	}
 
-	// Message options
-	cmd.Flags().IntVar(&c.messages, "messages", 1, "Number of messages to publish and receive")
-	cmd.Flags().StringVar(&c.topic, "topic", defaultTopic(), "Topic to publish and subscribe to")
-	cmd.Flags().IntVar(&c.qos, "qos", DefaultQOS, "MQTT QOS")
-	cmd.Flags().IntVar(&c.size, "size", 0, "Approximate size of each message (pub adds a timestamp)")
-
-	// Test options
+	cmd.Flags().IntVar(&c.pubOpts.messages, "messages", 1, "Number of messages to publish and receive")
+	cmd.Flags().IntVar(&c.pubOpts.mps, "mps", 1000, `Publish mps messages per second; 0 means no delay`)
+	cmd.Flags().IntVar(&c.pubOpts.qos, "qos", DefaultQOS, "MQTT QOS")
+	cmd.Flags().IntVar(&c.pubOpts.size, "size", 0, "Message extra payload size (in addition to the JSON timestamp)")
+	cmd.Flags().StringVar(&c.pubOpts.topic, "topic", defaultTopic(), "Topic (or base topic if --topics > 1)")
+	cmd.Flags().IntVar(&c.pubOpts.topics, "topics", 1, "Number of topics to use, If more than one will add /1, /2, ... to --topic when publishing, and subscribe to topic/+")
+	cmd.Flags().StringVar(&c.pubServer, "pub-server", "", "Server to publish to. Defaults to the first server in --servers")
 	cmd.Flags().IntVar(&c.subscribers, "subscribers", 1, `Number of subscribers to run concurrently`)
+
+	cmd.PreRun = func(_ *cobra.Command, _ []string) {
+		c.pubOpts.clientID = ClientID + "-pub"
+		c.pubOpts.timestamp = true
+		s := c.pubServer
+		if s == "" {
+			s = Servers[0]
+		}
+		c.pubOpts.dials = []dial{dial(s)}
+
+		c.subOpts.clientID = ClientID + "-sub"
+		c.subOpts.expectPublished = c.pubOpts.messages
+		c.subOpts.expectTimestamp = true
+		c.subOpts.filterPrefix = c.pubOpts.topic
+		c.subOpts.qos = c.pubOpts.qos
+		c.subOpts.repeat = 1
+		c.subOpts.topic = c.pubOpts.topic
+		if c.pubOpts.topics > 1 {
+			c.subOpts.topic = c.pubOpts.topic + "/+"
+		}
+	}
 
 	return cmd
 }
 
 func (c *pubsubCommand) run(_ *cobra.Command, _ []string) {
-	clientID := ClientID + "-sub"
 	readyCh := make(chan struct{})
-	errCh := make(chan error)
-	statsCh := make(chan *Stat)
+	doneCh := make(chan struct{})
 
-	// Connect all subscribers (and subscribe)
-	for i := 0; i < c.subscribers; i++ {
-		r := &receiver{
-			clientID:        clientID + "-" + strconv.Itoa(i),
-			topic:           c.topic,
-			qos:             c.qos,
-			expectPublished: c.messages,
-			repeat:          1,
-		}
-		go r.receive(readyCh, statsCh, errCh)
+	counter := 0
+	if len(Servers) > 1 || c.subscribers > 1 {
+		counter = 1
 	}
+	N := c.subscribers * len(Servers)
 
-	// Wait for all subscriptions to signal ready
-	cSub := 0
-	timeout := time.NewTimer(Timeout)
-	defer timeout.Stop()
-	for cSub < c.subscribers {
-		select {
-		case <-readyCh:
-			cSub++
-		case err := <-errCh:
-			log.Fatal(err)
-		case <-timeout.C:
-			log.Fatalf("timeout waiting for subscribers to be ready")
-		}
-	}
-
-	// ready to receive, start publishing. The publisher will exit when done, no need to wait for it.
-	p := &publisher{
-		clientID:    ClientID + "-pub",
-		messageOpts: c.messageOpts,
-		messages:    c.messages,
-		mps:         1000,
-	}
-	go p.publish(nil, errCh, true)
-
-	// wait for the stats
-	total := Stat{
-		NS: make(map[string]time.Duration),
-	}
-	timeout = time.NewTimer(Timeout)
-	defer timeout.Stop()
-	for i := 0; i < c.subscribers; i++ {
-		select {
-		case stat := <-statsCh:
-			total.Ops += stat.Ops
-			total.Bytes += stat.Bytes
-			for k, v := range stat.NS {
-				total.NS[k] += v
+	// Connect all subscribers and subscribe. Wait for all subscriptions to
+	// signal ready before publishing.
+	for _, d := range dials(Servers) {
+		for i := 0; i < c.subscribers; i++ {
+			r := c.subOpts // copy
+			if r.clientID == "" {
+				r.clientID = ClientID
 			}
-		case err := <-errCh:
-			log.Fatalf("Error: %v", err)
-		case <-timeout.C:
-			log.Fatalf("Error: timeout waiting for messages")
+			if counter != 0 {
+				r.clientID = r.clientID + "-" + strconv.Itoa(counter)
+				counter++
+			}
+			r.dial = d
+			go r.receive(readyCh, doneCh)
 		}
 	}
+	waitN(readyCh, N, "subscribers to be ready")
 
-	bb, _ := json.Marshal(total)
-	os.Stdout.Write(bb)
+	// ready to receive, start publishing. Give the publisher the same done
+	// channel, will wait for one more.
+	go c.pubOpts.publish(doneCh)
+
+	waitN(doneCh, N+1, "publisher and all subscribers to finish")
 }

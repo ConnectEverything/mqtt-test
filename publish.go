@@ -18,39 +18,55 @@ import (
 	"log"
 	"strconv"
 	"time"
+
+	paho "github.com/eclipse/paho.mqtt.golang"
 )
 
-// Message options
-type messageOpts struct {
-	qos    int
-	retain bool
-	size   int
-	topic  string
-}
-
 type publisher struct {
-	messageOpts
-
-	mps      int
-	messages int
-	topics   int
-	clientID string
+	clientID  string
+	dials     []dial
+	messages  int    // send this many messages
+	mps       int    // send at this rate (messages per second)
+	qos       int    // MQTT QOS
+	retain    bool   // Mark each published message as retained
+	size      int    // Approximate size of each message (may add a timestamp)
+	timestamp bool   // Prepend a timestamp to each message
+	topic     string // Base topic (prefix) to publish into (/{n} will be added if --topics > 0)
+	topics    int    // Cycle through this many topics appending "/{n}"
 }
 
-func (p *publisher) publish(msgCh chan *Stat, errorCh chan error, timestamp bool) {
-	cl, _, cleanup, err := connect(p.clientID, CleanSession)
-	if err != nil {
-		log.Fatal(err)
+func (p *publisher) publish(doneCh chan struct{}) {
+	defer func() {
+		if doneCh != nil {
+			doneCh <- struct{}{}
+		}
+	}()
+
+	// Connect to all servers.
+	clients := make([]paho.Client, len(p.dials))
+	for i, d := range p.dials {
+		id := p.clientID
+		if len(p.dials) > 1 {
+			id = p.clientID + "-" + strconv.Itoa(i)
+		}
+
+		cl, cleanup, err := connect(dial(d), id, CleanSession)
+		if err != nil {
+			log.Fatal(err)
+		}
+		defer cleanup()
+		clients[i] = cl
 	}
-	defer cleanup()
 
-	opts := cl.OptionsReader()
 	start := time.Now()
-	var elapsed time.Duration
-	bc := 0
 	iTopic := 0
-
+	iServer := 0
 	for n := 0; n < p.messages; n++ {
+		// Get a round-robin client.
+		i := iServer % len(p.dials)
+		iServer++
+		d := dial(p.dials[i])
+		cl := clients[i]
 		now := time.Now()
 		if n > 0 && p.mps > 0 {
 			next := start.Add(time.Duration(n) * time.Second / time.Duration(p.mps))
@@ -61,7 +77,7 @@ func (p *publisher) publish(msgCh chan *Stat, errorCh chan error, timestamp bool
 		// is always terminated with a '-', which can not be part of the random
 		// fill. payload is then filled to the requested size with random data.
 		payload := randomPayload(p.size)
-		if timestamp {
+		if p.timestamp {
 			structuredPayload, _ := json.Marshal(PubValue{
 				Seq:       n,
 				Timestamp: time.Now().UnixNano(),
@@ -75,27 +91,22 @@ func (p *publisher) publish(msgCh chan *Stat, errorCh chan error, timestamp bool
 		}
 
 		currTopic := p.topic
-		if p.topics > 0 {
+		if p.topics > 1 {
 			currTopic = p.topic + "/" + strconv.Itoa(iTopic)
 			iTopic = (iTopic + 1) % p.topics
 		}
 
 		startPublish := time.Now()
 		if token := cl.Publish(currTopic, byte(p.qos), p.retain, payload); token.Wait() && token.Error() != nil {
-			errorCh <- token.Error()
+			log.Fatal(token.Error())
 			return
 		}
+
 		elapsedPublish := time.Since(startPublish)
-		elapsed += elapsedPublish
-		logOp(opts.ClientID(), "PUB <-", elapsedPublish, "Published: %d bytes to %q, qos:%v, retain:%v", len(payload), currTopic, p.qos, p.retain)
-		bc += mqttPublishLen(currTopic, byte(p.qos), p.retain, payload)
+		pubBytes := mqttPublishLen(currTopic, byte(p.qos), p.retain, payload)
+		opts := cl.OptionsReader()
+
+		recordOp(opts.ClientID(), d, "pub", 1, elapsedPublish, pubBytes, "<- Published: %d bytes to %q, qos:%v, retain:%v", pubBytes, currTopic, p.qos, p.retain)
 	}
 
-	if msgCh != nil {
-		msgCh <- &Stat{
-			Ops:   p.messages,
-			NS:    map[string]time.Duration{"pub": elapsed},
-			Bytes: int64(bc),
-		}
-	}
 }
