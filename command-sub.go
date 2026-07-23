@@ -103,7 +103,7 @@ func runSubPrepublishRetained(
 		go p.publish(nil, errCh, true)
 
 		// wait for the initial subscription to have received all messages
-		timeout := time.NewTimer(Timeout)
+		timeout := time.NewTimer(RunTimeout)
 		defer timeout.Stop()
 		select {
 		case err := <-errCh:
@@ -135,7 +135,7 @@ func runSubPrepublishRetained(
 	total := &Stat{
 		NS: make(map[string]time.Duration),
 	}
-	timeout := time.NewTimer(Timeout)
+	timeout := time.NewTimer(RunTimeout)
 	defer timeout.Stop()
 	for i := 0; i < nSubscribers*repeat; i++ {
 		select {

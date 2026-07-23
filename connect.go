@@ -77,7 +77,9 @@ func connect(clientID string, cleanSession bool) (paho.Client, *Stat, func(), er
 		SetStore(paho.NewMemoryStore()).
 		SetAutoReconnect(false).
 		SetDefaultPublishHandler(func(client paho.Client, msg paho.Message) {
-			log.Fatalf("received an unexpected message on %q (default handler)", msg.Topic())
+			// Can happen legitimately, e.g. a message in flight racing an
+			// unsubscribe; do not kill the run for it.
+			log.Printf("WARNING: unexpected message on %q (default handler)", msg.Topic())
 		}))
 
 	disconnectedWG.Add(1)
