@@ -49,6 +49,7 @@ func newPubCommand() *cobra.Command {
 	// Test options
 	cmd.Flags().IntVar(&c.mps, "mps", 1000, `Publish mps messages per second; 0 means no delay`)
 	cmd.Flags().IntVar(&c.messages, "messages", 1, "Number of transactions to run, see the specific command")
+	cmd.Flags().IntVar(&c.pipeline, "pipeline", 1, `Max QoS1/2 publishes in flight per publisher; 1 means wait for each ack (measures per-publish latency), >1 measures wall-clock throughput and requires --mps 0`)
 	cmd.Flags().IntVar(&c.publishers, "publishers", 1, `Number of publishers to run concurrently, at --mps each`)
 	cmd.Flags().IntVar(&c.topics, "topics", 0, `Cycle through NTopics appending "/{n}"`)
 
@@ -56,9 +57,21 @@ func newPubCommand() *cobra.Command {
 }
 
 func (c *pubCommand) run(_ *cobra.Command, _ []string) {
+	// In pipelined mode the reported "pub" duration is total wall time, so
+	// an --mps throttle would be folded into the result and make it neither
+	// a latency nor a throughput measurement.
+	if c.pipeline > 1 && c.mps != 0 {
+		log.Fatal("--pipeline > 1 measures wall-clock throughput and requires --mps 0")
+	}
+
 	msgChan := make(chan *Stat)
 	errChan := make(chan error)
 
+	// runStart bounds the whole concurrent fan-out. With one publisher this
+	// equals its own "pub" duration; with --publishers N the per-publisher
+	// durations overlap, so their sum is not wall time. Aggregate throughput
+	// (ops over real elapsed) must divide by this, not by the summed "pub".
+	runStart := time.Now()
 	for i := 0; i < c.publishers; i++ {
 		p := c.publisher // copy
 		p.clientID = ClientID + "-" + strconv.Itoa(i)
@@ -68,7 +81,8 @@ func (c *pubCommand) run(_ *cobra.Command, _ []string) {
 	pubOps := 0
 	pubNS := time.Duration(0)
 	pubBytes := int64(0)
-	timeout := time.NewTimer(Timeout)
+	var lat *LatStats
+	timeout := time.NewTimer(RunTimeout)
 	defer timeout.Stop()
 
 	// get back 1 report per publisher
@@ -78,6 +92,10 @@ func (c *pubCommand) run(_ *cobra.Command, _ []string) {
 			pubOps += stat.Ops
 			pubNS += stat.NS["pub"]
 			pubBytes += stat.Bytes
+			// Percentiles can not be merged exactly; report the worst
+			// publisher's, which is conservative. With one publisher (the
+			// common benchmarking case) this is simply its stats.
+			lat = maxLatStats(lat, stat.Lat)
 			n++
 
 		case err := <-errChan:
@@ -90,8 +108,9 @@ func (c *pubCommand) run(_ *cobra.Command, _ []string) {
 
 	bb, _ := json.Marshal(Stat{
 		Ops:   pubOps,
-		NS:    map[string]time.Duration{"pub": pubNS},
+		NS:    map[string]time.Duration{"pub": pubNS, "wall": time.Since(runStart)},
 		Bytes: pubBytes,
+		Lat:   lat,
 	})
 	os.Stdout.Write(bb)
 }

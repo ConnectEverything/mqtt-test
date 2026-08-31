@@ -72,7 +72,7 @@ func (c *pubsubCommand) run(_ *cobra.Command, _ []string) {
 
 	// Wait for all subscriptions to signal ready
 	cSub := 0
-	timeout := time.NewTimer(Timeout)
+	timeout := time.NewTimer(RunTimeout)
 	defer timeout.Stop()
 	for cSub < c.subscribers {
 		select {
@@ -98,7 +98,7 @@ func (c *pubsubCommand) run(_ *cobra.Command, _ []string) {
 	total := Stat{
 		NS: make(map[string]time.Duration),
 	}
-	timeout = time.NewTimer(Timeout)
+	timeout = time.NewTimer(RunTimeout)
 	defer timeout.Stop()
 	for i := 0; i < c.subscribers; i++ {
 		select {

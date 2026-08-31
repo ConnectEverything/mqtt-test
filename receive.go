@@ -106,7 +106,7 @@ func (r *receiver) msgHandler(client paho.Client, msg paho.Message) {
 			r.errCh <- fmt.Errorf("received unexpected retained message")
 			return
 		}
-		logOp(clientID, "RRET ->", time.Since(r.start), "Received %d bytes on %q, qos:%v", len(msg.Payload()), msg.Topic(), msg.Qos())
+		logNoisy(clientID, "RRET ->", time.Since(r.start), "Received %d bytes on %q, qos:%v", len(msg.Payload()), msg.Topic(), msg.Qos())
 		r.bc.Add(int64(len(msg.Payload())))
 
 		if newC < int32(r.expectRetained) {
@@ -137,7 +137,7 @@ func (r *receiver) msgHandler(client paho.Client, msg paho.Message) {
 			log.Fatalf("Error parsing message JSON: %v", err)
 		}
 		elapsed := time.Since(time.Unix(0, v.Timestamp))
-		logOp(clientID, "RPUB ->", elapsed, "Received %d bytes on %q, qos:%v", len(msg.Payload()), msg.Topic(), msg.Qos())
+		logNoisy(clientID, "RPUB ->", elapsed, "Received %d bytes on %q, qos:%v", len(msg.Payload()), msg.Topic(), msg.Qos())
 
 		dur := r.durPublished.Add(int64(elapsed))
 		bb := r.bc.Add(int64(len(msg.Payload())))

@@ -19,6 +19,7 @@ import (
 	"log"
 	"math/rand"
 	"os"
+	"sort"
 	"sync"
 	"time"
 
@@ -29,10 +30,9 @@ import (
 
 const (
 	Name                     = "mqtt-test"
-	Version                  = "v0.1.0"
+	Version                  = "v0.2.0"
 	DefaultServer            = "tcp://localhost:1883"
 	DefaultQOS               = 0
-	Timeout                  = 10 * time.Second
 	DisconnectCleanupTimeout = 500 // milliseconds
 )
 
@@ -43,6 +43,11 @@ var (
 	Servers  []string
 	Username string
 	Verbose  bool
+
+	// RunTimeout bounds both the wait for an individual ack and the overall
+	// wait for results. The old hard-coded 10s regularly aborted legitimate
+	// slow runs (e.g. QoS1 against a replicated store).
+	RunTimeout time.Duration
 )
 
 var disconnectedWG = sync.WaitGroup{}
@@ -66,6 +71,7 @@ func init() {
 
 	mainCmd.PersistentFlags().StringArrayVar(&Servers, "servers", []string{DefaultServer}, "MQTT endpoint as username:password@host:port")
 	mainCmd.PersistentFlags().MarkDeprecated("servers", "please use server instead.")
+	mainCmd.PersistentFlags().DurationVar(&RunTimeout, "timeout", 60*time.Second, "Max wait for an ack and for overall results")
 
 	mainCmd.PersistentPreRun = func(cmd *cobra.Command, args []string) {
 		paho.CRITICAL = log.New(os.Stderr, "[MQTT CRIT] ", 0)
@@ -97,6 +103,73 @@ type Stat struct {
 	Ops   int                      `json:"ops"`
 	NS    map[string]time.Duration `json:"ns"`
 	Bytes int64                    `json:"bytes"`
+
+	// Lat carries per-message ack-latency percentiles when the command
+	// samples them (pub). Optional and additive: consumers that only know
+	// Ops/NS/Bytes ignore it.
+	Lat *LatStats `json:"lat,omitempty"`
+}
+
+// LatStats are percentiles over per-message latency samples, in nanoseconds.
+type LatStats struct {
+	N   int           `json:"n"`
+	P50 time.Duration `json:"p50"`
+	P95 time.Duration `json:"p95"`
+	P99 time.Duration `json:"p99"`
+	Max time.Duration `json:"max"`
+}
+
+// latencyStats computes percentiles from samples; returns nil if empty.
+// Sorts in place.
+func latencyStats(lats []time.Duration) *LatStats {
+	if len(lats) == 0 {
+		return nil
+	}
+	sort.Slice(lats, func(i, j int) bool { return lats[i] < lats[j] })
+	at := func(p float64) time.Duration {
+		i := int(p * float64(len(lats)-1))
+		return lats[i]
+	}
+	return &LatStats{
+		N:   len(lats),
+		P50: at(0.50),
+		P95: at(0.95),
+		P99: at(0.99),
+		Max: lats[len(lats)-1],
+	}
+}
+
+// maxLatStats returns the element-wise worse of two LatStats (nil-safe),
+// used to aggregate across publishers where percentiles can not be merged.
+func maxLatStats(a, b *LatStats) *LatStats {
+	if a == nil {
+		return b
+	}
+	if b == nil {
+		return a
+	}
+	m := func(x, y time.Duration) time.Duration {
+		if x > y {
+			return x
+		}
+		return y
+	}
+	return &LatStats{
+		N:   a.N + b.N,
+		P50: m(a.P50, b.P50),
+		P95: m(a.P95, b.P95),
+		P99: m(a.P99, b.P99),
+		Max: m(a.Max, b.Max),
+	}
+}
+
+// logNoisy is for per-message logging on hot paths: it is a no-op unless
+// --very-verbose, so the fmt work is not even performed when discarded.
+func logNoisy(clientID, op string, dur time.Duration, f string, args ...interface{}) {
+	if !Verbose {
+		return
+	}
+	logOp(clientID, op, dur, f, args...)
 }
 
 func randomPayload(sz int) []byte {
